@@ -1,5 +1,6 @@
 import numpy as np
 import numpy.random
+import GPy
 import pkgutil
 from Bio.Seq import Seq
 from Bio import SeqIO
@@ -10,32 +11,27 @@ from SHMModels.fitted_models import ContextModel
 #from timeit import default_timer as timer
 
 
-class MutationRound(object):
-    """A round of deamination and repair, resulting in mutations. A MutationRound has the following properties:
+class MutationProcess(object):
+    """Simulates the mutation process. A  MutationProcess has the following properties:
 
     Attributes:
     start_seq -- The initial sequence.
-    aid_lesions -- The locations of AID lesions.
-    repair_types -- How each lesion was repaired.
+    aid_lesions -- The locations and times of AID lesions.
+    repair_types -- The locations, types, and times of the repairs.
     pol_eta_params -- A dictionary, keyed by nucleotide, each element
     describing the probability of Pol eta creating a mutation from
     that nucleotide to another nucleotide.
     ber_params -- A vector describing the probability that the BER
     machinery incorporates each nucleotide.
-    exo_params -- The number of bases exo1 strips out to the left and
-    to the right.
-    replication_time -- Amount of time allowed for repair machinery to
-    work. If machinery not recruited by this time, lesion is
-    replicated over (C->T mutation).
+    exo_params -- Parameters determining the number of bases exo1
+    strips out to the left and to the right.
+    n_time_bins -- The number of bins for discretizing mutation times.
 
     """
 
     def __init__(self, start_seq,
-                 replication_time=1,
                  ber_lambda=1,
                  mmr_lambda=1,
-                 bubble_size=20,
-                 aid_time=1,
                  exo_params={'left': .2, 'right': .2},
                  pol_eta_params={
                      'A': [1, 0, 0, 0],
@@ -43,41 +39,38 @@ class MutationRound(object):
                      'C': [0, 0, 1, 0],
                      'T': [0, 0, 0, 1]
                  },
-                 p_fw=.5,
                  ber_params=[0, 0, 1, 0],
-                 aid_context_model=None):
-        """Returns a MutationRound object with a specified start_seq"""
+                 aid_context_model=None,
+                 gp_lengthscale={'space': 10, 'time': .2},
+                 n_time_bins = 100):
+        """Returns a MutationProcess object with a specified start_seq"""
         if not isinstance(start_seq, Seq):
             raise TypeError("The input sequence must be a Seq object")
         # we're going to need reverse complements, so the alphabet is important
         if not isinstance(start_seq.alphabet, type(IUPAC.unambiguous_dna)):
             raise TypeError("The alphabet must be IUPAC.unambiguous_dna")
         self.start_seq = start_seq
-        self.replication_time = replication_time
-        self.bubble_size = bubble_size
-        self.aid_time = aid_time
         self.ber_lambda = ber_lambda
         self.mmr_lambda = mmr_lambda
         self.exo_params = exo_params
         self.pol_eta_params = pol_eta_params
         self.ber_params = ber_params
-        self.p_fw = p_fw
         self.aid_context_model = aid_context_model
+        self.gp_lengthscale = gp_lengthscale
         self.NUCLEOTIDES = ["A", "G", "C", "T"]
-        self.mmr_sizes = []
+        self.n_time_bins = n_time_bins
 
-    def mutation_round(self):
+    def generate_mutations(self):
         self.sample_lesions()
-        self.sample_repair_types()
-        self.sample_repaired_sequence()
+        #self.sample_repair_types()
+        #self.sample_repaired_sequence()
 
     def sample_lesions(self):
         """Sample lesions induced by AID"""
         self.aid_lesions = make_aid_lesions(self.start_seq,
                                             context_model=self.aid_context_model,
-                                            bubble_size=self.bubble_size,
-                                            time=self.aid_time,
-                                            p_fw=self.p_fw)
+                                            gp_lengthscale=self.gp_lengthscale,
+                                            n_time_bins=self.n_time_bins)
 
     def sample_repair_types(self):
         """Sample a repaired sequence given a base sequence and lesions."""
@@ -88,8 +81,7 @@ class MutationRound(object):
         self.repair_types = create_repair_types(self.aid_lesions,
                                                 ber_wait_times,
                                                 mmr_wait_times,
-                                                exo_positions,
-                                                self.replication_time)
+                                                exo_positions)
 
     def sample_repaired_sequence(self):
         int_seq = self.start_seq
@@ -273,11 +265,16 @@ def get_next_repair(repair_list):
         return(next_repair, new_repair_list)
 
 
-def make_aid_lesions(sequence, context_model, bubble_size=20, time=1, p_fw=.5):
+def make_aid_lesions(sequence, context_model, gp_lengthscale, n_time_bins):
     """Simulates AID lesions on a sequence
 
     Keyword arguments:
     sequence -- A Seq object using the IUPAC Alphabet
+    context_model -- A model giving relative rates of deamination in
+    different nucleotide contexts.
+    gp_lengthscale -- A list with one element for the space
+    lengthscale and one for the time lengthscale.
+    n_time_bins -- How many bins to discretize the unit interval into.
 
     Returns: A pair of vectors, the first giving the indices of lesions
     on the forward strand and the second giving the indices of lesions
@@ -288,108 +285,63 @@ def make_aid_lesions(sequence, context_model, bubble_size=20, time=1, p_fw=.5):
         raise TypeError("The input sequence must be a Seq object")
     if not isinstance(sequence.alphabet, type(IUPAC.unambiguous_dna)):
         raise TypeError("The input sequence must have an IUPAC.unambiguous_dna alphabet")
-    # choose a random position in the sequence and a strand
-    stop_site = np.random.randint(0, len(sequence))
-    strand = np.random.choice(["fw", "rc"], size=1, p=[p_fw, 1 - p_fw])
-    lesions = deaminate_in_bubble(sequence, bubble_size, stop_site,
-                                  strand, context_model, time)
+    # Create a matrix describing a draw from the Gaussian process prior
+    gp_array = draw_from_gp(len(sequence), n_time_bins, gp_lengthscale)
+    base_rate_array = make_base_rate_array(sequence, context_model, n_time_bins)
+    rate_array = np.exp(gp_array) * base_rate_array
+    lesions = np.random.poisson(rate_array)
     return lesions
 
-
-def c_bases_in_bubble(sequence, bubble_size, stop_site, strand):
-    """Identifies all the Cs in a transcription bubble
-
-    Keyword arguments:
-    sequence -- A Seq object.
-    bubble_size -- The size of transcription bubble.
-    stop_site -- The 3'-most nucleotide in the transcription bubble.
-    strand -- The strand to be deaminated, can be "fw" or "rc".
-
-    Returns: A pair of vectors, the first giving the indices of C's on
-    the forward strand and the second giving the indices of C's on the
-    reverse complement.
-
-    """
-    l = len(sequence)
-    if stop_site > (l - 1) or stop_site < 0:
-        raise ValueError("'stop_site' must be between 0 and l-1")
-    if strand == "fw":
-        idx_lo = np.max([0, stop_site - (bubble_size - 1)])
-        idx_hi = stop_site
-        cs_fw = [i for i in range(idx_lo, idx_hi + 1)
-                 if sequence[i] == "C"]
-        cs_rc = []
-    elif strand == "rc":
-        idx_lo = np.max([0, l - 1 - stop_site])
-        idx_hi = np.min([l - 1 - stop_site + (bubble_size - 1), l - 1])
-        cs_fw = []
-        cs_rc = [i for i in range(idx_lo, idx_hi + 1)
-                 if sequence.reverse_complement()[i] == "C"]
-    else:
-        raise ValueError("strand must be either 'fw' or 'rc'")
-    return (cs_fw, cs_rc)
-
-
-def deaminate_in_bubble(sequence, bubble_size, stop_site, strand,
-                        context_model, time=1):
-    """Simulates deamination of Cs in a transcription bubble
+def draw_from_gp(seq_length, n_time_bins, gp_lengthscale):
+    """Creates a matrix describing a draw from a GP
 
     Keyword arguments:
-    sequence -- A Seq object.
-    bubble_size -- The size of the region in which C's are available
-    for deamination.
-    stop_site -- The 3'-most nucleotide available for deamination,
-    described in terms of the forward strand.
-    strand -- The strand to be deaminated, can be "fw" or "rc".
-    time -- The amount of time AID is bound.
-
-    Returns: A pair of vectors, the first giving the indices of
-    lesions on the forward strand and the second giving the indices of
-    lesions on the reverse complement.
-
-    """
-    (c_idx_fw, c_idx_rc) = c_bases_in_bubble(sequence,
-                                             bubble_size,
-                                             stop_site,
-                                             strand)
-    c_rates_fw = get_aid_rates(c_idx_fw, sequence, strand="fw", context_model=context_model)
-    c_rates_rc = get_aid_rates(c_idx_rc, sequence, strand="rc", context_model=context_model)
-    waiting_times_fw = [np.random.exponential(scale=1/r) for r in c_rates_fw]
-    waiting_times_rc = [np.random.exponential(scale=1/r) for r in c_rates_rc]
-    deam_fw = [i for (i, wt) in zip(c_idx_fw, waiting_times_fw) if wt <= time]
-    deam_rc = [i for (i, wt) in zip(c_idx_rc, waiting_times_rc) if wt <= time]
-    return (deam_fw, deam_rc)
-
-
-def get_aid_rates(idx, sequence, strand, context_model):
-    """Computes deamination rates for positions in a sequence
-
-    Keyword arguments:
-    idx -- A vector containing indices of C's to be deaminated
-    sequence -- The sequence the C's are found in.
-    strand -- Whether idx refers to a position on the fw strand or the
-    rc strand.
-    context_model -- A ContextModel object describing deamination
-    probabilities.
+    seq_length --- The length of the sequence.
+    n_time_bins --- The number of time bins for discretization.
+    gp_lengthscale --- A dictionary with one element for the space
+    lengthscale and another element for the time lengthscale.
 
     Returns:
-    A vector of the same size as idx containing deamination rates.
+    An array of size 2 x seq_length x n_time_bins
 
     """
-    if strand == "fw":
-        probs = [context_model.get_context_prob(i, sequence) for i in idx]
-        if any([p is None for p in probs]):
-            print idx, probs
-        rates = [-np.log(1 - p) for p in probs]
-    elif strand == "rc":
-        probs = [context_model.get_context_prob(len(sequence) - i, sequence.reverse_complement()) for i in idx]
-        if any([p is None for p in probs]):
-            print idx, probs
-        rates = [-np.log(1 - p) for p in probs]
-    else:
-        raise ValueError("strand must be either 'fw' or 'rc'")    
-    return rates
+    # The kernel overall is a product of one over the sequence and one over time
+    k_seq = GPy.kern.RBF(input_dim = 1, lengthscale = gp_lengthscale["space"], active_dims = [0])
+    k_time = GPy.kern.RBF(input_dim = 1, lengthscale = gp_lengthscale["time"], active_dims = [1])
+    k = k_seq * k_time
+    # Draw from the GP
+    seqs, times = np.mgrid[0:seq_length, 0:n_time_bins]
+    times = times / float(n_time_bins)
+    X = np.vstack((seqs.flatten(), times.flatten())).T
+    K = k.K(X)
+    s = np.random.multivariate_normal(np.zeros(X.shape[0]), K)
+    seq_and_time_draw = s.reshape(*seqs.shape)
+    # Output is repeated, one for fw strand and one for rc
+    return np.array([seq_and_time_draw, seq_and_time_draw])
 
+
+def make_base_rate_array(sequence, context_model, n_time_bins):
+    """Creates a matrix giving the AID deamination rates at every position
+in the sequence
+
+    Keyword arguments:
+    sequence --- The sequence that will accumulate lesions.
+    context_model --- A context model giving probabilities of AID lesions by context.
+    n_time_bins --- Number of time bins for discretization.
+
+    Returns:
+    An array of size 2 x length(sequence) x n_time_bins
+    """
+    fw_probs = [context_model.get_context_prob(i, sequence) for i in range(len(sequence))]
+    rc_probs = [context_model.get_context_prob(len(sequence) - i - 1, sequence.reverse_complement()) for i in range(len(sequence))]
+    print fw_probs
+    print rc_probs
+    fw_rates = [-np.log(1 - p) for p in fw_probs]
+    rc_rates = [-np.log(1 - p) for p in rc_probs]
+    sequence_rates = np.array([fw_rates, rc_rates])
+    sequence_rates.shape = [sequence_rates.shape[0], sequence_rates.shape[1], 1]
+    sequence_and_time_rates = np.tile(sequence_rates, [1,1,n_time_bins])
+    return sequence_and_time_rates
 
 def simulate_sequences_abc(germline_sequence,
                            aid_context_model,
