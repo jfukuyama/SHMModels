@@ -3,7 +3,6 @@ import StringIO
 import numpy as np
 import fnmatch
 
-
 class ContextModel:
     """Contains the information about mutation probabilities from a context model."""
     def __init__(self, context_length, pos_mutating, csv_string):
@@ -33,6 +32,8 @@ class ContextModel:
         self.context_dict = d_out
 
     def get_context_prob(self, idx, sequence):
+        if(sequence[idx] != "C"):
+            return 0
         # for positions on the flanks, we compute the marginal
         # probabilities as needed
         context = self.get_context(idx, sequence)
@@ -47,9 +48,9 @@ class ContextModel:
 
     def get_context(self, idx, sequence):
         if self.in_flank(idx, len(sequence)):
-            sequence = "N" * self.pad_left + sequence + "N" * self.pad_right
+            sequence = ["N"] * self.pad_left + sequence + ["N"] * self.pad_right
             idx = idx + self.pad_left
-        return sequence[(idx-self.pad_left):(idx+self.pad_right+1)]
+        return "".join(sequence[(idx-self.pad_left):(idx+self.pad_right+1)])
 
     def in_flank(self, idx, seq_len):
         if idx < self.pos_mutating:

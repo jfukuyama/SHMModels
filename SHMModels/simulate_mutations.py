@@ -8,8 +8,6 @@ from Bio.SeqRecord import SeqRecord
 from Bio.Alphabet import IUPAC
 from SHMModels.summary_statistics import write_all_stats
 from SHMModels.fitted_models import ContextModel
-#from timeit import default_timer as timer
-
 
 class MutationProcess(object):
     """Simulates the mutation process. A  MutationProcess has the following properties:
@@ -49,7 +47,9 @@ class MutationProcess(object):
         # we're going to need reverse complements, so the alphabet is important
         if not isinstance(start_seq.alphabet, type(IUPAC.unambiguous_dna)):
             raise TypeError("The alphabet must be IUPAC.unambiguous_dna")
-        self.start_seq = start_seq
+        # store the sequence as a 2 x len(sequence) array for forward and complement
+        self.start_seq = np.array([list(str(start_seq)), list(str(start_seq.complement()))])
+        self.seq_len = self.start_seq.shape[1]
         self.ber_lambda = ber_lambda
         self.mmr_lambda = mmr_lambda
         self.exo_params = exo_params
@@ -62,8 +62,8 @@ class MutationProcess(object):
 
     def generate_mutations(self):
         self.sample_lesions()
-        #self.sample_repair_types()
-        #self.sample_repaired_sequence()
+        self.sample_repairs()
+        self.sample_repaired_sequence()
 
     def sample_lesions(self):
         """Sample lesions induced by AID"""
@@ -72,58 +72,90 @@ class MutationProcess(object):
                                             gp_lengthscale=self.gp_lengthscale,
                                             n_time_bins=self.n_time_bins)
 
-    def sample_repair_types(self):
-        """Sample a repaired sequence given a base sequence and lesions."""
+    def sample_repairs(self):
+        """Sample repairs for every AID lesion."""
         # first get waiting times to recruit the BER/MMR machinery
-        ber_wait_times = self.sample_ber_wait_times()
-        mmr_wait_times = self.sample_mmr_wait_times()
-        exo_positions = self.sample_exo_positions()
-        self.repair_types = create_repair_types(self.aid_lesions,
-                                                ber_wait_times,
-                                                mmr_wait_times,
-                                                exo_positions)
+        self.repair_types = []
+        for strand in [0, 1]:
+            for location in range(self.seq_len):
+                for time in range(self.n_time_bins):
+                    if self.aid_lesions[strand, location, time] != 0:
+                        self.repair_types.append(self.sample_one_repair(strand, location, time))
+
+    def sample_one_repair(self, strand, location, time):
+        # If our Poisson process drew more than one AID lesion in a
+        # bin, jitter the time a little bit
+        if self.aid_lesions[strand,location, time] > 1:
+            time = time + (np.random.uniform() - .5)
+        aid_time = time / float(self.n_time_bins)
+        # repair type is ber w.p. lambda_b / (lambda_b + lambda_m)
+        if np.random.uniform() <= (self.ber_lambda / (self.ber_lambda + self.mmr_lambda)):
+            repair_type = "ber"
+        else:
+            repair_type = "mmr"
+        # repair time is aid_time + exponential(lambda_b + lambda_m)
+        repair_time = aid_time + np.random.exponential(self.ber_lambda + self.mmr_lambda)
+        # exo_hi is a truncated version of a geometric distribution
+        exo_left = np.random.geometric(self.exo_params['left'])
+        exo_right = np.random.geometric(self.exo_params['right'])
+        if strand == 0:
+            exo_lo = max(0, location - exo_left)
+            exo_hi = min(self.seq_len - 1, location + exo_right)
+        else:
+            exo_lo = max(0, location - exo_right)
+            exo_hi = min(self.seq_len - 1, location + exo_left)
+        return Repair(strand, location, aid_time, repair_type, repair_time, exo_lo, exo_hi)
 
     def sample_repaired_sequence(self):
-        int_seq = self.start_seq
-        # choose either the fw or rc strand to sample
-        strand = np.random.choice([0, 1], size=1, p=[self.p_fw, 1-self.p_fw])[0]
-        repairs = list(self.repair_types[strand])
-        while len(repairs) > 0:
-            # get the next lesion to repair and how to repair it,
-            # update the list of resolutions to remove it and any
-            # others that are resolved in the process.
-            (rt, repairs) = get_next_repair(repairs)
-            # add the info about exo length here
-            if(rt.repair_type == "mmr"):
-                self.mmr_sizes = self.mmr_sizes + [rt.exo_hi - rt.exo_lo]
-            if strand == 0:
-                int_seq = self.sample_sequence_given_repair(int_seq, rt)
-            elif strand == 1:
-                int_seq = self.sample_sequence_given_repair(int_seq.reverse_complement(), rt).reverse_complement()
-            else:
-                raise ValueError("Something went wrong, strand should be either 0 or 1, it was " + strand)
-        self.repaired_sequence = int_seq
+        intermediate_seq = self.start_seq
+        ## sort the repairs in the order they occur
+        self.repair_types.sort(key = lambda x: x.repair_time)
+        for r in self.repair_types:
+            self.process_one_repair(r, intermediate_seq)
+        self.repaired_sequence = intermediate_seq
 
-    def sample_sequence_given_repair(self, sequence, r):
-        """Samples an intermediate sequence given input and repair type.
+    def process_one_repair(self, repair, sequence):
+        """Samples an intermediate sequence from a repair and updates the list of repairs based on the intermediate sequence
 
         Keyword arguments:
-        sequence -- A Seq object containing the input sequence.
-        r -- A Repair object describing the repair.
-
-        Returns: A new sequence.
+        repair -- A repair object, describing the location and type of the repair
+        sequence -- The sequence to be repaired
         """
-        # so we can replace elements of the string
-        s = list(str(sequence))
-        if r.repair_type == "replicate":
-            s[r.idx] = "T"
-        elif r.repair_type == "ber":
-            s[r.idx] = self.sample_ber()
-        elif r.repair_type == "mmr":
-            s = self.sample_pol_eta(s, r.exo_lo, r.exo_hi)
-            
-        s = "".join(s)
-        return Seq(s, alphabet=IUPAC.unambiguous_dna)
+        exo_strips = []
+        c_mutations = []
+        strand = repair.strand
+        idx = repair.idx
+        if repair.repair_type == "ber":
+            sequence[strand][idx] = self.sample_ber()
+            if sequence[strand][idx] != "C":
+                c_mutations.append((strand, idx))
+        elif repair.repair_type == "mmr":
+            for idx in range(repair.exo_lo, repair.exo_hi):
+                old_base = sequence[strand][idx]
+                new_base = self.sample_mmr(old_base)
+                sequence[strand][idx] = new_base
+                if (old_base == "C") & (new_base != "C"):
+                    c_mutations.append((strand, idx))
+                exo_strips.append((strand, idx))
+        ## Mark repairs that will no longer happen
+        # exo_strips and c_mutations are lists, elements are tuples of
+        # (strand, idx) corresponding to locations of exo stripping or
+        # locations where a c mutated to something else
+        self.update_repairs(exo_strips, c_mutations, repair.repair_time)
+
+    def update_repairs(self, exo_strips, c_mutations, repair_time):
+        # if the repair has an AID time later than the repair time
+        # and the current repair changed a C at that position to
+        # something else, set the repair to None
+        for r in self.repair_types:
+            if(r.repair_type != "none"):
+                if (r.aid_time > repair_time) & ((r.strand, r.idx) in c_mutations):
+                    r.repair_type = "none"
+                ## If the repair has an AID time earlier than the repair
+                ## time and the current repair's exo window covered the
+                ## lesion position, set the repair to None
+                elif (r.aid_time < repair_time) & ((r.strand, r.idx) in exo_strips):
+                    r.repair_type = "none"
 
     def sample_ber(self):
         """Samples a nucleotide as repaired by BER.
@@ -132,138 +164,36 @@ class MutationProcess(object):
         """
         return np.random.choice(self.NUCLEOTIDES, size=1, p=self.ber_params)[0]
 
-    def sample_pol_eta(self, seq, lo, hi):
-        """Samples sequences repaired by pol eta
+    def sample_mmr(self, old_base):
+        """Samples a nucleotide as repaired by MMR.
 
-        Keyword arguments:
-        seq -- A list of characters describing the base sequence.
-        lo -- The index of the most 5' nucleotide to be sampled.
-        hi -- The index of the most 3' nucleotide to be sampled.
-
-        Returns: A list of characters describing the sampled sequence.
+        Returns: A nucleotide.
         """
-        new_seq = seq
-        for i in range(lo, hi + 1):
-            new_seq[i] = np.random.choice(self.NUCLEOTIDES, size=1, p=self.pol_eta_params[seq[i]])[0]
-        return new_seq
-
-    def sample_ber_wait_times(self):
-        # for every lesion, sample a random exponential with rate
-        # parameter ber_lambda
-        return((np.random.exponential([1. / self.ber_lambda for
-                                       _ in self.aid_lesions[0]]),
-                np.random.exponential([1. / self.ber_lambda for
-                                       _ in self.aid_lesions[1]])))
-
-    def sample_mmr_wait_times(self):
-        # for every lesion, sample a random exponential with rate parameter mmr_lambda
-        return((np.random.exponential([1. / self.mmr_lambda for
-                                       _ in self.aid_lesions[0]]),
-                np.random.exponential([1. / self.mmr_lambda for
-                                       _ in self.aid_lesions[1]])))
-
-    def sample_exo_positions(self):
-        l = len(self.start_seq)
-        exo_positions = ([(max(0, a - np.random.geometric(self.exo_params['left'])),
-                           min(a + np.random.geometric(self.exo_params['right']), l - 1)) for
-                          a in self.aid_lesions[0]],
-                         [(max(0, a - np.random.geometric(self.exo_params['left'])),
-                           min(a + np.random.geometric(self.exo_params['right']), l - 1)) for
-                          a in self.aid_lesions[1]])
-        return(exo_positions)
+        return np.random.choice(self.NUCLEOTIDES, size = 1, p=self.pol_eta_params[old_base])[0]
 
 class Repair(object):
     """Describes how a lesion is repaired. A Repair object has the following properties:
 
     Attributes:
     idx -- The location of the lesion.
-    repair_type -- The type of repair machinery recruited first.
+    aid_time -- The time of the AID lesion.
+    repair_type -- The type of repair machinery recruited first, or
+    'none' if the repair was made impossible by a prior repair.
     repair_time -- The time at which the repair machinery is recruited.
-    exo_lo -- The position of the most 3' base stripped out by EXO1.
-    exo_hi -- The position of the most 5' base stripped out by EXO1.
+    exo_lo -- The position of the left-most base stripped out by EXO1.
+    exo_hi -- The position of the right-most base stripped out by
+    EXO1. The bases stripped out are [strand][idx][exo_lo:exo_hi]
 
     """
-    def __init__(self, idx, repair_type, repair_time, exo_lo, exo_hi):
+    def __init__(self, strand, idx, aid_time, repair_type, repair_time, exo_lo, exo_hi):
+        self.strand = strand
         self.idx = idx
-        self.time = repair_time
+        self.aid_time = aid_time
+        self.repair_time = repair_time
         self.repair_type = repair_type
         if repair_type == "mmr":
             self.exo_lo = exo_lo
             self.exo_hi = exo_hi
-
-
-def create_repair_types(aid_lesions, ber_wait_times, mmr_wait_times, exo_positions, replication_time):
-    """Creates repair types from recruitment times for repair machinery.
-
-    Keyword arguments:
-    aid_lesions -- Two lists, first containing the indices of aid
-    lesions on the fw strand, second containing the indices of aid
-    lesions on the rc strand.
-    ber_wait_times -- Two lists, giving recruitment times of ber
-    machinery to each of the aid lesions.
-    mmr_wait_times -- Two lists, giving recruitment times of the mmr
-    machinery to each of the aid lesions.
-    exo_positions -- Two lists, giving the indices of the 5'-most and
-    3'-most bases that would be stripped out if each lesion were
-    repaired by mmr.
-    replication_time -- If no repair machinery is recruited by this
-    time, the lesion gets replicated over.
-
-    Returns: Two lists of Repair objects describing the first type of
-    repair machinery recruited to each lesion and how it will act.
-
-    """
-    repairs = ([], [])
-    for strand in [0, 1]:
-        zipped = zip(aid_lesions[strand],
-                     ber_wait_times[strand],
-                     mmr_wait_times[strand],
-                     exo_positions[strand])
-        for (idx, bwt, mwt, el) in zipped:
-            if replication_time < bwt and replication_time < mwt:
-                repairs[strand].append(Repair(idx=idx,
-                                              repair_type="replicate",
-                                              repair_time=replication_time,
-                                              exo_lo=None,
-                                              exo_hi=None))
-            elif bwt < mwt:
-                repairs[strand].append(Repair(idx=idx,
-                                              repair_type="ber",
-                                              repair_time=bwt,
-                                              exo_lo=None,
-                                              exo_hi=None))
-            else:
-                repairs[strand].append(Repair(idx=idx,
-                                              repair_type="mmr",
-                                              repair_time=mwt,
-                                              exo_lo=el[0],
-                                              exo_hi=el[1]))
-    return repairs
-
-
-def get_next_repair(repair_list):
-    """Describes repair types for a set of lesions
-
-    Keyword arguments:
-    repair_list -- A list of Repair objects.
-
-    Returns: A tuple giving the index and repair type of the next
-    lesion to repair along with the remaining lesions.
-
-    """
-    (next_repair_time, next_repair, next_repair_idx) = \
-        min([(val.time, val, idx) for (idx, val) in enumerate(repair_list)])
-    new_repair_list = list(repair_list)
-    if next_repair.repair_type == "mmr":
-        # we only keep repairs that are outside of the range of exo
-        new_repair_list = [r for r in new_repair_list if
-                           r.idx < next_repair.exo_lo or
-                           r.idx > next_repair.exo_hi]
-        return (next_repair, new_repair_list)
-    else:
-        new_repair_list.pop(next_repair_idx)
-        return(next_repair, new_repair_list)
-
 
 def make_aid_lesions(sequence, context_model, gp_lengthscale, n_time_bins):
     """Simulates AID lesions on a sequence
@@ -281,12 +211,8 @@ def make_aid_lesions(sequence, context_model, gp_lengthscale, n_time_bins):
     on the reverse complement.
 
     """
-    if not isinstance(sequence, Seq):
-        raise TypeError("The input sequence must be a Seq object")
-    if not isinstance(sequence.alphabet, type(IUPAC.unambiguous_dna)):
-        raise TypeError("The input sequence must have an IUPAC.unambiguous_dna alphabet")
     # Create a matrix describing a draw from the Gaussian process prior
-    gp_array = draw_from_gp(len(sequence), n_time_bins, gp_lengthscale)
+    gp_array = draw_from_gp(sequence.shape[1], n_time_bins, gp_lengthscale)
     base_rate_array = make_base_rate_array(sequence, context_model, n_time_bins)
     rate_array = np.exp(gp_array) * base_rate_array
     lesions = np.random.poisson(rate_array)
@@ -332,97 +258,21 @@ in the sequence
     Returns:
     An array of size 2 x length(sequence) x n_time_bins
     """
-    fw_probs = [context_model.get_context_prob(i, sequence) for i in range(len(sequence))]
-    rc_probs = [context_model.get_context_prob(len(sequence) - i - 1, sequence.reverse_complement()) for i in range(len(sequence))]
-    print fw_probs
-    print rc_probs
+    seq_len = sequence.shape[1]
+    # lesion probabilities for the fw strand
+    fw_probs = [context_model.get_context_prob(i, list(sequence[0,:])) for i in range(seq_len)]
+    # sequence[1,:] is the complementary strand, we need the reverse complement for the context model
+    rc_sequence = list(reversed(sequence[1,:]))
+    rc_probs = [context_model.get_context_prob(i, rc_sequence) for i in range(seq_len)]
+    # convert to rates. We are storing the fw strand and the
+    # complementary strand, not the reverse complementary strand, and
+    # so we need to re-reverse the rc_probs list we made before.
     fw_rates = [-np.log(1 - p) for p in fw_probs]
-    rc_rates = [-np.log(1 - p) for p in rc_probs]
-    sequence_rates = np.array([fw_rates, rc_rates])
+    c_rates = list(reversed([-np.log(1 - p) for p in rc_probs]))
+    # make the array with the rates over space, promote it so it has
+    # an extra dimension for time, and fill in over n_time_bins with a
+    # constant set of rates
+    sequence_rates = np.array([fw_rates, c_rates])
     sequence_rates.shape = [sequence_rates.shape[0], sequence_rates.shape[1], 1]
     sequence_and_time_rates = np.tile(sequence_rates, [1,1,n_time_bins])
     return sequence_and_time_rates
-
-def simulate_sequences_abc(germline_sequence,
-                           aid_context_model,
-                           context_model_length,
-                           context_model_pos_mutating,
-                           n_seqs,
-                           n_mutation_rounds,
-                           ss_file,
-                           param_file,
-                           sequence_file,
-                           n_sims,
-                           write_ss=True,
-                           write_sequences=False):
-
-    sequence = list(SeqIO.parse(germline_sequence, "fasta",
-                                alphabet=IUPAC.unambiguous_dna))[0]
-    aid_model_string = pkgutil.get_data("SHMModels", aid_context_model)
-    aid_model = ContextModel(context_model_length,
-                             context_model_pos_mutating,
-                             aid_model_string)
-    n_sum_stats = 310
-    n_params = 9
-    ss_array = np.zeros([n_sims, n_sum_stats])
-    param_array = np.zeros([n_sims, n_params])
-    mutated_seq_array = np.empty([n_sims * n_seqs, 2], dtype="S500")
-    for sim in range(n_sims):
-        mutated_seq_list = []
-        mmr_length_list = []
-        # the prior specification
-        #start_prior = timer()
-        ber_lambda = np.random.uniform(0, 1, 1)[0]
-        bubble_size = np.random.randint(5, 50)
-        exo_left = 1 / np.random.uniform(1, 50, 1)[0]
-        exo_right = 1 / np.random.uniform(1, 50, 1)[0]
-        pol_eta_params = {
-                     'A': [.9, .02, .02, .06],
-                     'G': [.01, .97, .01, .01],
-                     'C': [.01, .01, .97, .01],
-                     'T': [.06, .02, .02, .9]
-        }
-        ber_params = np.random.dirichlet([1, 1, 1, 1])
-        p_fw = np.random.uniform(0, 1, 1)[0]
-        #end_prior = timer()
-        #start_seqs = timer()
-        for i in range(n_seqs):
-            mr = MutationRound(sequence.seq,
-                               ber_lambda=ber_lambda,
-                               mmr_lambda=1 - ber_lambda,
-                               replication_time=100,
-                               bubble_size=bubble_size,
-                               aid_time=10,
-                               exo_params={'left': exo_left,
-                                           'right': exo_right},
-                               pol_eta_params=pol_eta_params,
-                               ber_params=ber_params,
-                               p_fw=p_fw,
-                               aid_context_model=aid_model)
-            for j in range(n_mutation_rounds):
-                mr.mutation_round()
-                mr.start_seq = mr.repaired_sequence
-            mutated_seq_list.append(SeqRecord(mr.repaired_sequence, id=""))
-            if(len(mr.mmr_sizes) > 0):
-                mmr_length_list.append(np.mean(mr.mmr_sizes))
-        #end_seqs = timer()
-        #start_ss = timer()
-        if write_ss:
-            ss_array[sim, :] = write_all_stats(sequence,
-                                            mutated_seq_list,
-                                            np.mean(mmr_length_list),
-                                            file=None)
-        params = [ber_lambda, bubble_size, exo_left, exo_right, ber_params[0], ber_params[1], ber_params[2], ber_params[3], p_fw]
-        param_array[sim, :] = params
-        if write_sequences:
-            seq_strings = [str(ms.seq) for ms in mutated_seq_list]
-            mutated_seq_array[(sim * n_seqs):((sim + 1) * n_seqs),0] = seq_strings
-            mutated_seq_array[(sim * n_seqs):((sim + 1) * n_seqs),1] = sim
-        #end_ss = timer()
-        #print("Draw the prior: {}, Simulate sequences: {}, Write summary statistics: {}".format(end_prior - start_prior, end_seqs - start_seqs, end_ss - start_ss))
-    np.savetxt(param_file, param_array, delimiter=",")
-    if write_ss:
-        np.savetxt(ss_file, ss_array, delimiter=",")
-    if write_sequences:
-        np.savetxt(sequence_file, mutated_seq_array, delimiter=",", fmt="%s")
-    return (param_array, ss_array)
