@@ -2,6 +2,7 @@ import numpy as np
 import numpy.random
 import GPy
 import pkgutil
+import copy
 from Bio.Seq import Seq
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
@@ -61,6 +62,7 @@ class MutationProcess(object):
         self.NUCLEOTIDES = ["A", "G", "C", "T"]
         self.n_time_bins = n_time_bins
         self.overall_rate_offset = overall_rate_offset
+        self.aid_lesions_per_site = np.zeros((2, self.seq_len))
 
     def generate_mutations(self):
         self.sample_lesions()
@@ -112,10 +114,12 @@ class MutationProcess(object):
         return Repair(strand, location, aid_time, repair_type, repair_time, exo_lo, exo_hi)
 
     def sample_repaired_sequence(self):
-        intermediate_seq = self.start_seq
+        intermediate_seq = copy.copy(self.start_seq)
         ## sort the repairs in the order they occur
         self.repair_types.sort(key = lambda x: x.repair_time)
         for r in self.repair_types:
+            # sample a new value for intermediate_seq and remove any
+            # repairs that no longer should occur
             self.process_one_repair(r, intermediate_seq)
         self.repaired_sequence = intermediate_seq
 
@@ -131,17 +135,19 @@ class MutationProcess(object):
         strand = repair.strand
         idx = repair.idx
         if repair.repair_type == "ber":
+            self.aid_lesions_per_site[strand,idx] = self.aid_lesions_per_site[strand, idx] + 1
             sequence[strand][idx] = self.sample_ber()
             if sequence[strand][idx] != "C":
                 c_mutations.append((strand, idx))
         elif repair.repair_type == "mmr":
-            for idx in range(repair.exo_lo, repair.exo_hi + 1):
-                old_base = sequence[strand][idx]
+            self.aid_lesions_per_site[strand,idx] = self.aid_lesions_per_site[strand, idx] + 1
+            for i in range(repair.exo_lo, repair.exo_hi + 1):
+                old_base = sequence[strand][i]
                 new_base = self.sample_pol_eta(old_base)
-                sequence[strand][idx] = new_base
+                sequence[strand][i] = new_base
                 if (old_base == "C") & (new_base != "C"):
-                    c_mutations.append((strand, idx))
-                exo_strips.append((strand, idx))
+                    c_mutations.append((strand, i))
+                exo_strips.append((strand, i))
         ## Mark repairs that will no longer happen
         # exo_strips and c_mutations are lists, elements are tuples of
         # (strand, idx) corresponding to locations of exo stripping or
