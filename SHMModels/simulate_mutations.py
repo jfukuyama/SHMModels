@@ -40,6 +40,7 @@ class MutationProcess(object):
                  ber_params=[0, 0, 1, 0],
                  aid_context_model=None,
                  gp_lengthscale={'space': 10, 'time': .2},
+                 overall_rate_offset = 1,
                  n_time_bins = 100):
         """Returns a MutationProcess object with a specified start_seq"""
         if not isinstance(start_seq, Seq):
@@ -59,6 +60,7 @@ class MutationProcess(object):
         self.gp_lengthscale = gp_lengthscale
         self.NUCLEOTIDES = ["A", "G", "C", "T"]
         self.n_time_bins = n_time_bins
+        self.overall_rate_offset = overall_rate_offset
 
     def generate_mutations(self):
         self.sample_lesions()
@@ -70,7 +72,8 @@ class MutationProcess(object):
         self.aid_lesions = make_aid_lesions(self.start_seq,
                                             context_model=self.aid_context_model,
                                             gp_lengthscale=self.gp_lengthscale,
-                                            n_time_bins=self.n_time_bins)
+                                            n_time_bins=self.n_time_bins,
+                                            overall_rate_offset = self.overall_rate_offset)
 
     def sample_repairs(self):
         """Sample repairs for every AID lesion."""
@@ -79,15 +82,17 @@ class MutationProcess(object):
         for strand in [0, 1]:
             for location in range(self.seq_len):
                 for time in range(self.n_time_bins):
-                    if self.aid_lesions[strand, location, time] != 0:
+                    ## if more than one lesion in the time bin, sample
+                    ## multiple repairs for that time bin
+                    for _ in range(self.aid_lesions[strand, location, time]):
                         self.repair_types.append(self.sample_one_repair(strand, location, time))
 
-    def sample_one_repair(self, strand, location, time):
+    def sample_one_repair(self, strand, location, time_idx):
         # If our Poisson process drew more than one AID lesion in a
         # bin, jitter the time a little bit
-        if self.aid_lesions[strand,location, time] > 1:
-            time = time + (np.random.uniform() - .5)
-        aid_time = time / float(self.n_time_bins)
+        if self.aid_lesions[strand,location, time_idx] > 1:
+            time_idx = time_idx + (np.random.uniform() - .5)
+        aid_time = time_idx / float(self.n_time_bins)
         # repair type is ber w.p. lambda_b / (lambda_b + lambda_m)
         if np.random.uniform() <= (self.ber_lambda / (self.ber_lambda + self.mmr_lambda)):
             repair_type = "ber"
@@ -130,9 +135,9 @@ class MutationProcess(object):
             if sequence[strand][idx] != "C":
                 c_mutations.append((strand, idx))
         elif repair.repair_type == "mmr":
-            for idx in range(repair.exo_lo, repair.exo_hi):
+            for idx in range(repair.exo_lo, repair.exo_hi + 1):
                 old_base = sequence[strand][idx]
-                new_base = self.sample_mmr(old_base)
+                new_base = self.sample_pol_eta(old_base)
                 sequence[strand][idx] = new_base
                 if (old_base == "C") & (new_base != "C"):
                     c_mutations.append((strand, idx))
@@ -164,8 +169,8 @@ class MutationProcess(object):
         """
         return np.random.choice(self.NUCLEOTIDES, size=1, p=self.ber_params)[0]
 
-    def sample_mmr(self, old_base):
-        """Samples a nucleotide as repaired by MMR.
+    def sample_pol_eta(self, old_base):
+        """Samples a nucleotide as repaired by pol eta.
 
         Returns: A nucleotide.
         """
@@ -195,11 +200,12 @@ class Repair(object):
             self.exo_lo = exo_lo
             self.exo_hi = exo_hi
 
-def make_aid_lesions(sequence, context_model, gp_lengthscale, n_time_bins):
+def make_aid_lesions(sequence, context_model, gp_lengthscale, n_time_bins, overall_rate_offset):
     """Simulates AID lesions on a sequence
 
     Keyword arguments:
-    sequence -- A Seq object using the IUPAC Alphabet
+    sequence -- An array with characters for nucleotides, dimension 2
+    x sequence length.
     context_model -- A model giving relative rates of deamination in
     different nucleotide contexts.
     gp_lengthscale -- A list with one element for the space
@@ -214,7 +220,7 @@ def make_aid_lesions(sequence, context_model, gp_lengthscale, n_time_bins):
     # Create a matrix describing a draw from the Gaussian process prior
     gp_array = draw_from_gp(sequence.shape[1], n_time_bins, gp_lengthscale)
     base_rate_array = make_base_rate_array(sequence, context_model, n_time_bins)
-    rate_array = np.exp(gp_array) * base_rate_array
+    rate_array = overall_rate_offset * np.exp(gp_array) * base_rate_array
     lesions = np.random.poisson(rate_array)
     return lesions
 
