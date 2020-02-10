@@ -1,177 +1,313 @@
 import unittest
 import numpy as np
 import pkgutil
+import copy
 from Bio.Seq import Seq
 from Bio.Alphabet import IUPAC
-from SHMModels.simulate_mutations import make_aid_lesions
-from SHMModels.simulate_mutations import c_bases_in_bubble
-from SHMModels.simulate_mutations import deaminate_in_bubble
-from SHMModels.simulate_mutations import Repair
-from SHMModels.simulate_mutations import get_next_repair
-from SHMModels.simulate_mutations import MutationRound
-from SHMModels.mutation_processing import mutation_subset
-from SHMModels.mutation_processing import mutation_subset_from_samm
+from SHMModels.simulate_mutations import *
 from SHMModels.fitted_models import ContextModel
 
 
-class testMutationSubset(unittest.TestCase):
+class testRepairs(unittest.TestCase):
 
     def setUp(self):
+        ## set up a mp with deterministic ber and pol eta parameters
+        naive_seq = Seq("CGCA", alphabet=IUPAC.unambiguous_dna)
+        cm = aid_context_model = ContextModel(3, 2, pkgutil.get_data("SHMModels", "data/aid_goodman.csv"))
+        ## BER always changes C to A
+        ber_params=[1, 0, 0, 0]
+        ## here pol eta always changes C to T
+        pol_eta_params={
+            'A': [1, 0, 0, 0],
+            'G': [0, 1, 0, 0],
+            'C': [0, 0, 0, 1],
+            'T': [0, 0, 0, 1]
+        }
+
+        self.mp = MutationProcess(
+            naive_seq,
+            pol_eta_params = pol_eta_params,
+            ber_params = ber_params,
+            aid_context_model = cm,
+            n_time_bins = 100)
+        self.mp.sample_lesions()
+        self.mp.sample_repairs()
+
+    def test_sample_repairs(self):
+        ## check that we have the right number of repairs (sum of
+        ## aid_lesions matrix is the same length as the repair types
+        ## object)
+        self.assertEqual(np.sum(self.mp.aid_lesions), len(self.mp.repair_types))
+
+    def test_sample_one_repair(self):
+        ## check that the AID time is computed correctly from the time
+        ## bins
+        strand = 0
+        idx = 0
+        time = 1
+        self.mp.aid_lesions[strand, idx, time] = 1
+        one_repair = self.mp.sample_one_repair(strand, idx, time)
+        ## Check that the repair matches the strand/location/time
+        self.assertEqual(one_repair.aid_time, float(time) / self.mp.n_time_bins)
+        self.assertEqual(one_repair.strand, strand)
+        self.assertEqual(one_repair.idx, idx)
+        ## if there are mutliple lesions in a time bin, we jitter the
+        ## time a little bit so that they do not happen at exactly the
+        ## same time
+        self.mp.aid_lesions[strand, idx, time] = 2
+        one_repair_multi_lesion = self.mp.sample_one_repair(strand, idx, time)
+        time_ub = (time + .5) / self.mp.n_time_bins
+        time_lb = (time - .5) / self.mp.n_time_bins
+        self.assertTrue(one_repair_multi_lesion.aid_time <= time_ub)
+        self.assertTrue(one_repair_multi_lesion.aid_time >= time_lb)
+        self.assertTrue(one_repair_multi_lesion.aid_time != float(time) / self.mp.n_time_bins)
+
+    def test_sample_repaired_sequence_ber(self):
+        ## in our test sequence, there is a C at the third position on
+        ## the forward strand (so idx = 2 because we are zero indexing)
+        strand = 0
+        idx = 2
+        aid_time = .5
+        repair_time = .6
+        exo_lo = 0
+        exo_hi = 2
+        ## set the MP to just have one repair, due to BER
+        one_ber_repair = Repair(strand = strand, idx = idx, aid_time = aid_time,
+                                repair_type = "ber",
+                                repair_time = repair_time,
+                                exo_lo = exo_lo, exo_hi = exo_hi)
+        self.mp.repair_types = [one_ber_repair]
+        self.mp.sample_repaired_sequence()
+        ## we set up so that BER always changes C to A
+        self.assertEqual(self.mp.repaired_sequence[strand,idx], "A")
+
+    def test_sample_repaired_sequence_mmr(self):
+        ## in our test sequence, there is a C at the third position on
+        ## the forward strand (so idx = 2 because we are zero indexing)
+        strand = 0
+        idx = 2
+        aid_time = .5
+        repair_time = .6
+        exo_lo = 0
+        exo_hi = 2
+        ## Set up a repair object for MMR with a certain exo window
+        ## and check that the sampled sequence is correct.
+        one_mmr_repair = Repair(strand = strand, idx = idx, aid_time = aid_time,
+                                repair_type = "mmr",
+                                repair_time = repair_time,
+                                exo_lo = exo_lo, exo_hi = exo_hi)
+        self.mp.repair_types = [one_mmr_repair]
+        self.mp.sample_repaired_sequence()
+        ## we set up so that pol eta always changes C to T
+        ## the nucleotide at position idx is the C corresponding to the lesion
+        self.assertEqual(self.mp.repaired_sequence[strand,idx], "T")
+        ## the nucleotide at position 0 is another C that is in the exo window
+        self.assertEqual(self.mp.repaired_sequence[strand,0], "T")
+
+    def test_repair_processing_c_mutated(self):
+        ## If at a certain position along the sequence, we draw a
+        ## potential lesion at times t1 and t2 and if the C base was
+        ## changed to another base at time t with t1 < t < t2, then
+        ## the lesion at time t2 doesn't recruit any machinery and
+        ## should be excluded.
+
+        ## Set up an mp object with some repairs
+        strand = 0; idx = 1
+        aid_time_1 = 1; repair_time_1 = 2; aid_time_2 = 3; repair_time_2 = 4
+        r1 = Repair(strand = strand, idx = idx,
+                    aid_time = aid_time_1, repair_time = repair_time_1,
+                    repair_type = "ber", exo_lo = np.nan, exo_hi = np.nan)
+        r2 = Repair(strand = strand, idx = idx,
+                    aid_time = aid_time_2, repair_time = repair_time_2,
+                    repair_type = "ber", exo_lo = np.nan, exo_hi = np.nan)
+        self.mp.repair_types = [r1, r2]
+        self.mp.process_one_repair(r1, self.mp.start_seq)
+        ## We set up so that BER deterministically mutates away from
+        ## C, so the first lesion made the second impossible
+        self.assertEqual(self.mp.repair_types[1].repair_type, "none")
+
+    def test_repair_processing_lesion_stripped(self):
+        ## If we have the following set of lesions and repairs:
+        ##      A
+        ##         A
+        ##    --M------
+
+        ## where we have two AID lesions, the first lesion repaired by
+        ## MMR, and the MMR machinery strips out a region including
+        ## the second lesion, the second lesion doesn't recruit any
+        ## machinery and should be excluded.
+
+        ## Set up an mp object with some repairs
+        ## on the forward strand
+        def repair_processing_results(aid_time_1, aid_time_2, repair_time_1, repair_time_2):
+            mp = copy.deepcopy(self.mp)
+            mp.pol_eta_params = {
+                'A': [1, 0, 0, 0],
+                'G': [0, 1, 0, 0],
+                'C': [0, 0, 1, 0],
+                'T': [0, 0, 0, 1]
+            }
+            strand = 0
+            ## first lesion at position 1, second lesion at position 2
+            idx1 = 1; idx2 = 2
+            ## First lesion repaired by MMR, which strips out bases between 0 and 3
+            exo_lo = 0; exo_hi = 3
+            r1 = Repair(strand = strand, idx = idx1,
+                        aid_time = aid_time_1, repair_time = repair_time_1,
+                        repair_type = "mmr", exo_lo = exo_lo, exo_hi = exo_hi)
+            r2 = Repair(strand = strand, idx = idx2,
+                        aid_time = aid_time_2, repair_time = repair_time_2,
+                        repair_type = "ber", exo_lo = np.nan, exo_hi = np.nan)
+            self.mp.repair_types = [r1, r2]
+            ## check that after the first repair is processed, the second gets set to "none"
+            self.mp.process_one_repair(r1, self.mp.start_seq)
+            return self.mp.repair_types[1].repair_type
+        ## the first lesion is stripped out before it has a chance to be repaired
+        self.assertEqual(repair_processing_results(1, 2, 3, 4), "none")
+        ## first lesion repaired but the C base doesn't change, so the
+        ## second lesion is still valid
+        self.assertEqual(repair_processing_results(1, 2, 1.5, 4), "ber")
+
+class testNucleotideSampling(unittest.TestCase):
+
+    def setUp(self):
+        ## set up a mp with deterministic ber and pol eta parameters
+        naive_seq = Seq("CGCA", alphabet=IUPAC.unambiguous_dna)
+        cm = aid_context_model = ContextModel(3, 2, pkgutil.get_data("SHMModels", "data/aid_goodman.csv"))
+        ## BER always changes C to A
+        ber_params=[1, 0, 0, 0]
+        ## here pol eta always changes C to T
+        pol_eta_params={
+            'A': [1, 0, 0, 0],
+            'G': [0, 1, 0, 0],
+            'C': [0, 0, 0, 1],
+            'T': [0, 0, 0, 1]
+        }
+
+        self.mp = MutationProcess(
+            naive_seq,
+            pol_eta_params = pol_eta_params,
+            ber_params = ber_params,
+            aid_context_model = cm,
+            n_time_bins = 100)
+
+
+    def test_sample_ber(self):
+        ## Set up with deterministic set of pol eta params, check that
+        ## it gets the right one
+        self.assertEqual(self.mp.sample_ber(), "A")
+
+    def test_sample_pol_eta(self):
+        ## Set up with deterministic set of pol eta params, check that
+        ## it gets the right one
+        self.assertEqual(self.mp.sample_pol_eta("A"), "A")
+        self.assertEqual(self.mp.sample_pol_eta("T"), "T")
+        self.assertEqual(self.mp.sample_pol_eta("C"), "T")
+        self.assertEqual(self.mp.sample_pol_eta("G"), "G")
+
+    def test_sample_repaired_sequence(self):
+        ## Set up a deterministic mp, check that the sequence comes
+        ## out correctly
         pass
 
-    def test_mutation_subset(self):
+
+
+class testLesionCreation(unittest.TestCase):
+
+    def setUp(self):
         naive_seq = Seq("AGCA", alphabet=IUPAC.unambiguous_dna)
-        mutated_seq = Seq("ATTT", alphabet=IUPAC.unambiguous_dna)
-        (_, ms1) = mutation_subset(naive_seq, mutated_seq, base="G")
-        (_, ms3) = mutation_subset(naive_seq, mutated_seq, base="C")
-        self.assertEqual(str(ms1), "ATCA")
-        self.assertEqual(str(ms3), "AGTA")
+        cm = aid_context_model = ContextModel(3, 2, pkgutil.get_data("SHMModels", "data/aid_goodman.csv"))
+        self.mp = MutationProcess(
+            naive_seq,
+            aid_context_model = cm,
+            n_time_bins = 100)
 
-    def test_mutation_subset_samm(self):
-        ms_both = mutation_subset_from_samm('test_seqs.csv', 'test_genes.csv',
-                                            base='c', strand='both')
-        ms_fw = mutation_subset_from_samm('test_seqs.csv', 'test_genes.csv',
-                                          base='c', strand='fw')
-        ms_rc = mutation_subset_from_samm('test_seqs.csv', 'test_genes.csv',
-                                          base='c', strand='rc')
-        self.assertEqual(ms_both.shape[0], 2)
-        self.assertEqual(ms_fw.shape[0], 1)
-        self.assertEqual(ms_rc.shape[0], 1)
+    def test_make_aid_lesions(self):
+        lesions = make_aid_lesions(self.mp.start_seq, self.mp.aid_context_model, self.mp.gp_lengthscale, self.mp.n_time_bins, self.overall_rate)
+        ## Correct shape
+        self.assertEqual(lesions.shape, (2, 4, 100))
+        ## All positive values
+        self.assertTrue((lesions >= 0).all())
+        ## Lesions only at C bases
+        for index, n_lesions in np.ndenumerate(lesions):
+            if n_lesions > 0:
+                self.assertEqual(self.mp.start_seq[index[0],index[1]], "C")
 
+    def test_draw_from_gp(self):
+        gp_draw = draw_from_gp(seq_length = 4, n_time_bins = 100, gp_lengthscale = self.mp.gp_lengthscale)
+        ## Correct shape
+        self.assertEqual(gp_draw.shape, (2, 4, 100))
 
-class testAIDLesion(unittest.TestCase):
+    def test_make_base_rate_array(self):
+        n_time_bins = 100
+        base_rate_array = make_base_rate_array(self.mp.start_seq,
+                                               self.mp.aid_context_model,
+                                               n_time_bins = n_time_bins)
+        ## correct shape
+        self.assertEqual(base_rate_array.shape, (2, self.mp.seq_len, n_time_bins))
+        ## consistent over time (third dimension)
+        for i1 in range(base_rate_array.shape[0]):
+            for i2 in range(base_rate_array.shape[1]):
+                rate_over_time = base_rate_array[i1,i2,:]
+                diff_from_t0 = rate_over_time - rate_over_time[0]
+                self.assertTrue(np.array_equal(diff_from_t0, [0.] * n_time_bins))
+        ## zero rates at non-C bases
+        for index, rate in np.ndenumerate(base_rate_array):
+            if self.mp.start_seq[index[0],index[1]] != "C":
+                self.assertEqual(base_rate_array[index[0],index[1],index[2]], 0)
 
-    def setUp(self):
-        pass
+# class testAIDLesion(unittest.TestCase):
 
-    def test_aid_lesion(self):
-        cm = ContextModel(3, 2, pkgutil.get_data("SHMModels", "data/aid_goodman.csv"))
-        # Input must be a seq object
-        self.assertRaises(TypeError, make_aid_lesions,
-                          "AGCT", cm)
-        # Input must have an IUPAC.unambiguous_dna alphabet
-        seq_wrong = Seq("AGCT", alphabet=IUPAC.protein)
-        self.assertRaises(TypeError, make_aid_lesions, seq_wrong, cm)
-        seq = Seq("AGCT", alphabet=IUPAC.unambiguous_dna)
-        (lesions_fw, lesions_rc) = make_aid_lesions(seq, cm)
-        # all the lesions should be at C positions
-        self.assertTrue(all([seq[i] == "C" for i in lesions_fw]))
-        self.assertTrue(all([seq.reverse_complement()[i] == "C"
-                             for i in lesions_rc]))
+#     def setUp(self):
+#         pass
 
-    def test_c_in_bubble(self):
-        seq = Seq("GCCCAG", alphabet=IUPAC.unambiguous_dna)
-        # should get a value error if the stop site is outside the
-        # range of the sequence
-        self.assertRaises(ValueError, c_bases_in_bubble, seq, 2, 20, "fw")
-        self.assertRaises(ValueError, c_bases_in_bubble, seq, 2, -5, "fw")
-        # should get a value error if the strand is not either "fw" or "rc"
-        self.assertRaises(ValueError, c_bases_in_bubble, seq, 2, 1, "wrong")
-        (lesions_fw, lesions_rc) = c_bases_in_bubble(seq,
-                                                     bubble_size=3,
-                                                     stop_site=5,
-                                                     strand="fw")
-        # lesions should only be at C positions
-        self.assertTrue(all([seq[i] == "C" for i in lesions_fw]))
-        self.assertEqual(lesions_fw, [3])
-        # since we're deaminating on the forward strand, we should
-        # have no lesions on the rc strand
-        self.assertEqual(len(lesions_rc), 0)
-        (lesions_fw, lesions_rc) = c_bases_in_bubble(seq,
-                                                     bubble_size=3,
-                                                     stop_site=2,
-                                                     strand="rc")
-        self.assertTrue(all([seq.reverse_complement()[i] == "C"
-                             for i in lesions_rc]))
-        self.assertEqual(lesions_rc, [5])
-        # deaminating on the rc strand means we should have no lesions
-        # on the fw strand
-        self.assertEqual(len(lesions_fw), 0)
+#     def test_aid_lesion(self):
+#         cm = ContextModel(3, 2, pkgutil.get_data("SHMModels", "data/aid_goodman.csv"))
+#         seq = Seq("AGCT", alphabet=IUPAC.unambiguous_dna)
+#         (lesions_fw, lesions_rc) = make_aid_lesions(seq, cm)
+#         # all the lesions should be at C positions
+#         self.assertTrue(all([seq[i] == "C" for i in lesions_fw]))
+#         self.assertTrue(all([seq.reverse_complement()[i] == "C"
+#                              for i in lesions_rc]))
 
-    def test_bubble_deamination(self):
-        context_model_string = pkgutil.get_data("SHMModels", "data/aid_goodman.csv")
-        cm = ContextModel(context_length=3, pos_mutating=2, csv_string=context_model_string)
-        s = Seq("C" * 10 + "A" * 10 + "C" * 10,
-                alphabet=IUPAC.unambiguous_dna)
-        (lesions_fw, lesions_rc) = deaminate_in_bubble(s, 20, len(s) - 1, "fw", cm, time=100)
-        # no lesions on the rc strand
-        self.assertEqual(len(lesions_rc), 0)
-        # all the deaminations on the fw strand should be between 20 and 29
-        if(len(lesions_fw) > 0):
-            self.assertTrue(np.max(lesions_fw) <= len(s))
-            self.assertTrue(np.min(lesions_fw) >= 20)
+#     def test_lesions(self):
+#         cm = ContextModel(3, 2, pkgutil.get_data("SHMModels", "data/aid_goodman.csv"))
+#         s = Seq("C" * 10 + "A" * 10 + "AACAGCAGCGACGTC",
+#                 alphabet=IUPAC.unambiguous_dna)
+#         (lesions_fw, lesions_rc) = make_aid_lesions(s, cm, 10, 5)
 
-    def test_lesions(self):
-        cm = ContextModel(3, 2, pkgutil.get_data("SHMModels", "data/aid_goodman.csv"))
-        s = Seq("C" * 10 + "A" * 10 + "AACAGCAGCGACGTC",
-                alphabet=IUPAC.unambiguous_dna)
-        (lesions_fw, lesions_rc) = make_aid_lesions(s, cm, 10, 5)
+#     def test_get_context(self):
+#         cm = ContextModel(context_length=5, pos_mutating=2, csv_string=None)
+#         cm2 = ContextModel(context_length=3, pos_mutating=2, csv_string=None)
+#         s = "AAGCT"
+#         self.assertEqual(cm.get_context(idx=2, sequence=s), "AAGCT")
+#         self.assertEqual(cm2.get_context(idx=2, sequence=s), "AAG")
+#         self.assertEqual(cm.get_context(idx=0, sequence=s), "NNAAG")
+#         self.assertEqual(cm.get_context(idx=4, sequence=s), "GCTNN")
 
-    def test_sample_wait_times(self):
-        return 0
+#     def test_in_flank(self):
+#         cm = ContextModel(context_length=5, pos_mutating=2, csv_string=None)
+#         self.assertTrue(cm.in_flank(idx=0, seq_len=10))
+#         self.assertTrue(cm.in_flank(idx=1, seq_len=10))
+#         self.assertFalse(cm.in_flank(idx=2, seq_len=10))
+#         self.assertTrue(cm.in_flank(idx=9, seq_len=10))
+#         self.assertTrue(cm.in_flank(idx=8, seq_len=10))
+#         self.assertFalse(cm.in_flank(idx=7, seq_len=10))
+#         cm2 = ContextModel(context_length=3, pos_mutating=2, csv_string=None)
+#         self.assertTrue(cm2.in_flank(idx=0, seq_len=10))
+#         self.assertTrue(cm2.in_flank(idx=1, seq_len=10))
+#         self.assertFalse(cm2.in_flank(idx=2, seq_len=10))
+#         self.assertFalse(cm2.in_flank(idx=9, seq_len=10))
+#         self.assertFalse(cm2.in_flank(idx=8, seq_len=10))
+#         self.assertFalse(cm2.in_flank(idx=7, seq_len=10))
 
-    def test_pol_eta(self):
-        # set a sequence, lesion, repair type, ber parameters, and
-        # call sample_repaired_sequence
-        mr = MutationRound(Seq("AAGCT", alphabet=IUPAC.unambiguous_dna))
-
-    def test_ber(self):
-        # set a sequence, lesion, repair type, ber parameters, and
-        # call sample_repaired_sequence
-        pass
-
-    def test_create_repair_types(self):
-        pass
-
-    def test_next_repair(self):
-        # test if one lesion is repaired by mmr and the other is
-        # repaired in the process
-        r1 = Repair(0, "mmr", .5, 0, 1)
-        r2 = Repair(1, "ber", 1, None, None)
-        (nr, new_repair_list) = get_next_repair([r1, r2])
-        self.assertEqual(nr.repair_type, "mmr")
-        self.assertEqual(nr.time, .5)
-        self.assertEqual(len(new_repair_list), 0)
-        # now suppose the first lesion is repaired by ber
-        r1 = Repair(0, "mmr", 1, 0, 1)
-        r2 = Repair(1, "ber", .5, None, None)
-        (nr, new_repair_list) = get_next_repair([r1, r2])
-        self.assertEqual(nr.repair_type, "ber")
-        self.assertEqual(nr.time, .5)
-        self.assertEqual(len(new_repair_list), 1)
-
-    def test_get_context(self):
-        cm = ContextModel(context_length=5, pos_mutating=2, csv_string=None)
-        cm2 = ContextModel(context_length=3, pos_mutating=2, csv_string=None)
-        s = "AAGCT"
-        self.assertEqual(cm.get_context(idx=2, sequence=s), "AAGCT")
-        self.assertEqual(cm2.get_context(idx=2, sequence=s), "AAG")
-        self.assertEqual(cm.get_context(idx=0, sequence=s), "NNAAG")
-        self.assertEqual(cm.get_context(idx=4, sequence=s), "GCTNN")
-
-    def test_in_flank(self):
-        cm = ContextModel(context_length=5, pos_mutating=2, csv_string=None)
-        self.assertTrue(cm.in_flank(idx=0, seq_len=10))
-        self.assertTrue(cm.in_flank(idx=1, seq_len=10))
-        self.assertFalse(cm.in_flank(idx=2, seq_len=10))
-        self.assertTrue(cm.in_flank(idx=9, seq_len=10))
-        self.assertTrue(cm.in_flank(idx=8, seq_len=10))
-        self.assertFalse(cm.in_flank(idx=7, seq_len=10))
-        cm2 = ContextModel(context_length=3, pos_mutating=2, csv_string=None)
-        self.assertTrue(cm2.in_flank(idx=0, seq_len=10))
-        self.assertTrue(cm2.in_flank(idx=1, seq_len=10))
-        self.assertFalse(cm2.in_flank(idx=2, seq_len=10))
-        self.assertFalse(cm2.in_flank(idx=9, seq_len=10))
-        self.assertFalse(cm2.in_flank(idx=8, seq_len=10))
-        self.assertFalse(cm2.in_flank(idx=7, seq_len=10))
-
-    def test_compute_marginal_prob(self):
-        cm = ContextModel(context_length=3, pos_mutating=2, csv_string=None)
-        cm.context_dict = {}
-        cm.context_dict["AAC"] = .5
-        cm.context_dict["AGC"] = .1
-        self.assertEqual(cm.compute_marginal_prob("NAC"), .5)
-        self.assertEqual(cm.compute_marginal_prob("NNC"), .3)
+#     def test_compute_marginal_prob(self):
+#         cm = ContextModel(context_length=3, pos_mutating=2, csv_string=None)
+#         cm.context_dict = {}
+#         cm.context_dict["AAC"] = .5
+#         cm.context_dict["AGC"] = .1
+#         self.assertEqual(cm.compute_marginal_prob("NAC"), .5)
+#         self.assertEqual(cm.compute_marginal_prob("NNC"), .3)
 
 
 if __name__ == '__main__':
