@@ -24,8 +24,6 @@ class MutationProcess(object):
     machinery incorporates each nucleotide.
     exo_params -- Parameters determining the number of bases exo1
     strips out to the left and to the right.
-    n_time_bins -- The number of bins for discretizing mutation times.
-
     """
 
     def __init__(self, start_seq,
@@ -41,8 +39,7 @@ class MutationProcess(object):
                  ber_params=[0, 0, 1, 0],
                  aid_context_model=None,
                  gp_lengthscale={'space': 10, 'time': .2},
-                 overall_rate_offset = 1,
-                 n_time_bins = 100):
+                 overall_rate = 1):
         """Returns a MutationProcess object with a specified start_seq"""
         if not isinstance(start_seq, Seq):
             raise TypeError("The input sequence must be a Seq object")
@@ -60,8 +57,7 @@ class MutationProcess(object):
         self.aid_context_model = aid_context_model
         self.gp_lengthscale = gp_lengthscale
         self.NUCLEOTIDES = ["A", "G", "C", "T"]
-        self.n_time_bins = n_time_bins
-        self.overall_rate_offset = overall_rate_offset
+        self.overall_rate = overall_rate
         self.aid_lesions_per_site = np.zeros((2, self.seq_len))
 
     def generate_mutations(self):
@@ -74,27 +70,17 @@ class MutationProcess(object):
         self.aid_lesions = make_aid_lesions(self.start_seq,
                                             context_model=self.aid_context_model,
                                             gp_lengthscale=self.gp_lengthscale,
-                                            n_time_bins=self.n_time_bins,
-                                            overall_rate_offset = self.overall_rate_offset)
+                                            overall_rate = self.overall_rate)
 
     def sample_repairs(self):
         """Sample repairs for every AID lesion."""
         # first get waiting times to recruit the BER/MMR machinery
         self.repair_types = []
-        for strand in [0, 1]:
-            for location in range(self.seq_len):
-                for time in range(self.n_time_bins):
-                    ## if more than one lesion in the time bin, sample
-                    ## multiple repairs for that time bin
-                    for _ in range(self.aid_lesions[strand, location, time]):
-                        self.repair_types.append(self.sample_one_repair(strand, location, time))
+        for row in range(self.aid_lesions.shape[0]):
+            lesion = self.aid_lesions[row,:]
+            self.repair_types.append(self.sample_one_repair(lesion[0], lesion[1], lesion[2]))
 
-    def sample_one_repair(self, strand, location, time_idx):
-        # If our Poisson process drew more than one AID lesion in a
-        # bin, jitter the time a little bit
-        if self.aid_lesions[strand,location, time_idx] > 1:
-            time_idx = time_idx + (np.random.uniform() - .5)
-        aid_time = time_idx / float(self.n_time_bins)
+    def sample_one_repair(self, strand, location, aid_time):
         # repair type is ber w.p. lambda_b / (lambda_b + lambda_m)
         if np.random.uniform() <= (self.ber_lambda / (self.ber_lambda + self.mmr_lambda)):
             repair_type = "ber"
@@ -197,16 +183,16 @@ class Repair(object):
 
     """
     def __init__(self, strand, idx, aid_time, repair_type, repair_time, exo_lo, exo_hi):
-        self.strand = strand
-        self.idx = idx
+        self.strand = int(strand)
+        self.idx = int(idx)
         self.aid_time = aid_time
         self.repair_time = repair_time
         self.repair_type = repair_type
         if repair_type == "mmr":
-            self.exo_lo = exo_lo
-            self.exo_hi = exo_hi
+            self.exo_lo = int(exo_lo)
+            self.exo_hi = int(exo_hi)
 
-def make_aid_lesions(sequence, context_model, gp_lengthscale, n_time_bins, overall_rate_offset):
+def make_aid_lesions(sequence, context_model, gp_lengthscale, overall_rate):
     """Simulates AID lesions on a sequence
 
     Keyword arguments:
@@ -216,59 +202,58 @@ def make_aid_lesions(sequence, context_model, gp_lengthscale, n_time_bins, overa
     different nucleotide contexts.
     gp_lengthscale -- A list with one element for the space
     lengthscale and one for the time lengthscale.
-    n_time_bins -- How many bins to discretize the unit interval into.
+    overall_rate -- A scalar controlling the overall rate of the PP.
 
-    Returns: A pair of vectors, the first giving the indices of lesions
-    on the forward strand and the second giving the indices of lesions
-    on the reverse complement.
+    Returns: A matrix with number of rows equal to number of
+    lesions. First column gives the strand, second column gives the
+    location along the sequence, and third column gives the time of
+    the lesion.
 
     """
     # Create a matrix describing a draw from the Gaussian process prior
-    gp_array = draw_from_gp(sequence.shape[1], n_time_bins, gp_lengthscale)
-    base_rate_array = make_base_rate_array(sequence, context_model, n_time_bins)
-    rate_array = overall_rate_offset * np.exp(gp_array) * base_rate_array
-    lesions = np.random.poisson(rate_array)
-    return lesions
+    base_rate_array = make_base_rate_array(sequence, context_model, overall_rate = overall_rate)
+    pp_draw = draw_poisson_process_from_base_rate(base_rate_array)
+    gp_draw = draw_from_gp(input_points = pp_draw, gp_lengthscale = gp_lengthscale)
+    points_to_keep = [np.random.uniform(0.0, 1.0, 1)[0] <= sigmoid(g) for g in gp_draw]
+    return pp_draw[points_to_keep,:]
 
-def draw_from_gp(seq_length, n_time_bins, gp_lengthscale):
+def draw_from_gp(input_points, gp_lengthscale):
     """Creates a matrix describing a draw from a GP
 
     Keyword arguments:
-    seq_length --- The length of the sequence.
-    n_time_bins --- The number of time bins for discretization.
+    input_points --- A J x 3 matrix, giving strand, index, and time of
+    the lesions.
     gp_lengthscale --- A dictionary with one element for the space
     lengthscale and another element for the time lengthscale.
 
     Returns:
-    An array of size 2 x seq_length x n_time_bins
+    A vector of length J
 
     """
+    # if input_points has length 0,
+    if input_points.shape[0] == 0:
+        return np.zeros(shape = (0,3))
     # The kernel overall is a product of one over the sequence and one over time
     k_seq = GPy.kern.RBF(input_dim = 1, lengthscale = gp_lengthscale["space"], active_dims = [0])
     k_time = GPy.kern.RBF(input_dim = 1, lengthscale = gp_lengthscale["time"], active_dims = [1])
     k = k_seq * k_time
-    # Draw from the GP
-    seqs, times = np.mgrid[0:seq_length, 0:n_time_bins]
-    times = times / float(n_time_bins)
-    X = np.vstack((seqs.flatten(), times.flatten())).T
+    X = input_points[:,[1,2]]
     K = k.K(X)
-    s = np.random.multivariate_normal(np.zeros(X.shape[0]), K)
-    seq_and_time_draw = s.reshape(*seqs.shape)
-    # Output is repeated, one for fw strand and one for rc
-    return np.array([seq_and_time_draw, seq_and_time_draw])
+    gp_draw = np.random.multivariate_normal(np.zeros(X.shape[0]), K)
+    return gp_draw
 
 
-def make_base_rate_array(sequence, context_model, n_time_bins):
+def make_base_rate_array(sequence, context_model, overall_rate):
     """Creates a matrix giving the AID deamination rates at every position
 in the sequence
 
     Keyword arguments:
     sequence --- The sequence that will accumulate lesions.
     context_model --- A context model giving probabilities of AID lesions by context.
-    n_time_bins --- Number of time bins for discretization.
+    overall_rate -- A scaling factor to increase or decrease the PP rate.
 
     Returns:
-    An array of size 2 x length(sequence) x n_time_bins
+    An array of size 2 x length(sequence)
     """
     seq_len = sequence.shape[1]
     # lesion probabilities for the fw strand
@@ -284,7 +269,37 @@ in the sequence
     # make the array with the rates over space, promote it so it has
     # an extra dimension for time, and fill in over n_time_bins with a
     # constant set of rates
-    sequence_rates = np.array([fw_rates, c_rates])
-    sequence_rates.shape = [sequence_rates.shape[0], sequence_rates.shape[1], 1]
-    sequence_and_time_rates = np.tile(sequence_rates, [1,1,n_time_bins])
-    return sequence_and_time_rates
+    sequence_rates = np.array([fw_rates, c_rates]) * overall_rate
+    return sequence_rates
+
+def draw_poisson_process_from_base_rate(base_rate_array):
+    """Draws from a Poisson Process
+
+    Keyword arguments:
+    base_rate_array -- A 2 x seq_len matrix, giving the rates for the
+    Poisson process at each position in the sequence.
+
+    Returns: A J x 3 matrix, rows corresponding to points sampled from
+    the Poisson process, first column strand, second column location
+    along the sequence, third column time.
+
+    """
+    ## Number of lesions per site comes from a Poisson with rate given by base_rate_array
+    n_lesions_per_site = np.zeros(base_rate_array.shape)
+    for idx, value in np.ndenumerate(base_rate_array):
+        n_lesions_per_site[idx[0], idx[1]] = np.random.poisson(lam = value, size = 1)
+    ## Each row of the lesion matrix is a 3-vector of [strand,
+    ## location on sequence, time] corresponding to one lesion
+    lesion_matrix = np.zeros((int(sum(sum(n_lesions_per_site))), 3))
+    ## For each site, we sample times uniformly in [0,1] for each of
+    ## the n_lesions and put each one in the lesion_matrix
+    row = 0
+    for idx, n_lesions in np.ndenumerate(n_lesions_per_site):
+        lesion_times = np.random.uniform(0.0, 1.0, int(n_lesions))
+        for t in lesion_times:
+            lesion_matrix[row, :] = [idx[0], idx[1], t]
+            row = row + 1
+    return lesion_matrix
+
+def sigmoid(x):
+  return 1 / (1 + np.exp(-x))

@@ -28,8 +28,7 @@ class testRepairs(unittest.TestCase):
             naive_seq,
             pol_eta_params = pol_eta_params,
             ber_params = ber_params,
-            aid_context_model = cm,
-            n_time_bins = 100)
+            aid_context_model = cm)
         self.mp.sample_lesions()
         self.mp.sample_repairs()
 
@@ -37,30 +36,10 @@ class testRepairs(unittest.TestCase):
         ## check that we have the right number of repairs (sum of
         ## aid_lesions matrix is the same length as the repair types
         ## object)
-        self.assertEqual(np.sum(self.mp.aid_lesions), len(self.mp.repair_types))
+        self.assertEqual(self.mp.aid_lesions.shape[0], len(self.mp.repair_types))
 
     def test_sample_one_repair(self):
-        ## check that the AID time is computed correctly from the time
-        ## bins
-        strand = 0
-        idx = 0
-        time = 1
-        self.mp.aid_lesions[strand, idx, time] = 1
-        one_repair = self.mp.sample_one_repair(strand, idx, time)
-        ## Check that the repair matches the strand/location/time
-        self.assertEqual(one_repair.aid_time, float(time) / self.mp.n_time_bins)
-        self.assertEqual(one_repair.strand, strand)
-        self.assertEqual(one_repair.idx, idx)
-        ## if there are mutliple lesions in a time bin, we jitter the
-        ## time a little bit so that they do not happen at exactly the
-        ## same time
-        self.mp.aid_lesions[strand, idx, time] = 2
-        one_repair_multi_lesion = self.mp.sample_one_repair(strand, idx, time)
-        time_ub = (time + .5) / self.mp.n_time_bins
-        time_lb = (time - .5) / self.mp.n_time_bins
-        self.assertTrue(one_repair_multi_lesion.aid_time <= time_ub)
-        self.assertTrue(one_repair_multi_lesion.aid_time >= time_lb)
-        self.assertTrue(one_repair_multi_lesion.aid_time != float(time) / self.mp.n_time_bins)
+        pass
 
     def test_sample_repaired_sequence_ber(self):
         ## in our test sequence, there is a C at the third position on
@@ -188,8 +167,7 @@ class testNucleotideSampling(unittest.TestCase):
             naive_seq,
             pol_eta_params = pol_eta_params,
             ber_params = ber_params,
-            aid_context_model = cm,
-            n_time_bins = 100)
+            aid_context_model = cm)
 
 
     def test_sample_ber(self):
@@ -219,42 +197,50 @@ class testLesionCreation(unittest.TestCase):
         cm = aid_context_model = ContextModel(3, 2, pkgutil.get_data("SHMModels", "data/aid_goodman.csv"))
         self.mp = MutationProcess(
             naive_seq,
-            aid_context_model = cm,
-            n_time_bins = 100)
+            aid_context_model = cm)
 
     def test_make_aid_lesions(self):
-        lesions = make_aid_lesions(self.mp.start_seq, self.mp.aid_context_model, self.mp.gp_lengthscale, self.mp.n_time_bins, self.overall_rate)
+        lesions = make_aid_lesions(self.mp.start_seq, self.mp.aid_context_model, self.mp.gp_lengthscale, self.mp.overall_rate)
         ## Correct shape
-        self.assertEqual(lesions.shape, (2, 4, 100))
+        self.assertEqual(lesions.shape[1], 3)
         ## All positive values
         self.assertTrue((lesions >= 0).all())
         ## Lesions only at C bases
-        for index, n_lesions in np.ndenumerate(lesions):
-            if n_lesions > 0:
-                self.assertEqual(self.mp.start_seq[index[0],index[1]], "C")
+        for i in range(lesions.shape[0]):
+            self.assertEqual(self.mp.start_seq[lesions[i,0],lesions[i,1]], "C")
 
     def test_draw_from_gp(self):
-        gp_draw = draw_from_gp(seq_length = 4, n_time_bins = 100, gp_lengthscale = self.mp.gp_lengthscale)
+        base_rate_array = make_base_rate_array(self.mp.start_seq,
+                                               self.mp.aid_context_model,
+                                               overall_rate = 10)
+        pp_draw = draw_poisson_process_from_base_rate(base_rate_array)
+        gp_draw = draw_from_gp(input_points = pp_draw, gp_lengthscale = self.mp.gp_lengthscale)
         ## Correct shape
-        self.assertEqual(gp_draw.shape, (2, 4, 100))
+        self.assertEqual(len(gp_draw), pp_draw.shape[0])
+
+    def test_draw_from_poisson_base_rate(self):
+        base_rate_array = make_base_rate_array(self.mp.start_seq,
+                                               self.mp.aid_context_model,
+                                               overall_rate = 10)
+        pp_draw = draw_poisson_process_from_base_rate(base_rate_array)
+        self.assertEqual(pp_draw.shape[1], 3)
+        self.assertTrue((pp_draw[:,2] >= 0).all())
+        self.assertTrue((pp_draw[:,2] < 1).all())
+        self.assertTrue((pp_draw[:,1] < self.mp.seq_len).all())
+        self.assertTrue((pp_draw[:,0] <= 1).all())
+        self.assertTrue((pp_draw[:,0] >= 0).all())
 
     def test_make_base_rate_array(self):
         n_time_bins = 100
         base_rate_array = make_base_rate_array(self.mp.start_seq,
                                                self.mp.aid_context_model,
-                                               n_time_bins = n_time_bins)
+                                               overall_rate = self.mp.overall_rate)
         ## correct shape
-        self.assertEqual(base_rate_array.shape, (2, self.mp.seq_len, n_time_bins))
-        ## consistent over time (third dimension)
-        for i1 in range(base_rate_array.shape[0]):
-            for i2 in range(base_rate_array.shape[1]):
-                rate_over_time = base_rate_array[i1,i2,:]
-                diff_from_t0 = rate_over_time - rate_over_time[0]
-                self.assertTrue(np.array_equal(diff_from_t0, [0.] * n_time_bins))
+        self.assertEqual(base_rate_array.shape, (2, self.mp.seq_len))
         ## zero rates at non-C bases
         for index, rate in np.ndenumerate(base_rate_array):
             if self.mp.start_seq[index[0],index[1]] != "C":
-                self.assertEqual(base_rate_array[index[0],index[1],index[2]], 0)
+                self.assertEqual(base_rate_array[index[0],index[1]], 0)
 
 # class testAIDLesion(unittest.TestCase):
 
