@@ -3,6 +3,7 @@ import numpy.random
 import GPy
 import pkgutil
 import copy
+import pdb
 from Bio.Seq import Seq
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
@@ -40,7 +41,8 @@ class MutationProcess(object):
                  aid_context_model=None,
                  gp_lengthscale={'space': 10, 'time': .2},
                  overall_rate = 1,
-                 replication_rate = 1):
+                 replication_rate = 1,
+                 show_process = False):
         """Returns a MutationProcess object with a specified start_seq"""
         if not isinstance(start_seq, Seq):
             raise TypeError("The input sequence must be a Seq object")
@@ -61,6 +63,7 @@ class MutationProcess(object):
         self.overall_rate = overall_rate
         self.aid_lesions_per_site = np.zeros((2, self.seq_len))
         self.replication_rate = replication_rate
+        self.show_process = show_process
 
     def generate_mutations(self):
         self.sample_lesions()
@@ -135,6 +138,8 @@ class MutationProcess(object):
         c_mutations = []
         strand = repair.strand
         idx = repair.idx
+        if self.show_process:
+            old_sequence = sequence.copy()
         if repair.repair_type == "ber":
             self.aid_lesions_per_site[strand,idx] = self.aid_lesions_per_site[strand, idx] + 1
             sequence[strand][idx] = self.sample_ber()
@@ -156,6 +161,8 @@ class MutationProcess(object):
             ## replace the non-template strand with the complement of
             ## the template strand
             sequence[nontemplate_strand,:] = make_complement(sequence[strand, :])
+        if self.show_process:
+            print_sequences_and_repairs(old_sequence, sequence, repair, exo_strips)
         ## Mark repairs that will no longer happen
         # exo_strips and c_mutations are lists, elements are tuples of
         # (strand, idx) corresponding to locations of exo stripping or
@@ -208,6 +215,8 @@ class Repair(object):
         self.strand = int(strand)
         if not np.isnan(idx):
             self.idx = int(idx)
+        else:
+            self.idx = idx
         self.aid_time = aid_time
         self.repair_time = repair_time
         self.repair_type = repair_type
@@ -339,6 +348,40 @@ def make_complement(seq):
                      "U" : "A"}
     complement = [substitutions[s] for s in seq]
     return complement
+
+def print_sequences_and_repairs(old_sequence, sequence, repair, exo_strips):
+    print_sequence(old_sequence)
+    print("Repair:")
+    print_repair(exo_strips = exo_strips,
+                     mutations = get_mutations(old_sequence, sequence),
+                     seq_len = old_sequence.shape[1])
+    print("type: {}, time: {}, strand: {}, location: {}".format(repair.repair_type, repair.repair_time, repair.strand, repair.idx))
+    print('\n')
+
+def get_mutations(old_sequence, sequence):
+    mutations = []
+    for s in [0,1]:
+        for i in range(sequence.shape[1]):
+            if old_sequence[s,i] != sequence[s,i]:
+                mutations.append((s,i,sequence[s,i]))
+    return mutations
+
+def print_repair(exo_strips, mutations, seq_len):
+    repair_array = np.array([["-"] * seq_len, ["-"] * seq_len])
+    for (s, i) in exo_strips:
+        repair_array[s,i] = "*"
+    for (s, i, n) in mutations:
+        repair_array[s,i] = n
+    top = "".join(repair_array[0])
+    bottom = "".join(repair_array[1])
+    strip_string = top + '\n' + bottom
+    print(strip_string)
+
+def print_sequence(sequence):
+    top = "".join(sequence[0,:])
+    bottom = "".join(sequence[1,:])
+    seq_string = top + '\n' + bottom
+    print(seq_string)
 
 def sigmoid(x):
   return 1 / (1 + np.exp(-x))
