@@ -188,6 +188,9 @@ class testNucleotideSampling(unittest.TestCase):
         ## out correctly
         pass
 
+    def test_make_complement(self):
+        self.assertEqual(make_complement(["A", "T", "U", "G", "C"]), ["T", "A", "A", "C", "G"])
+
 
 
 class testLesionCreation(unittest.TestCase):

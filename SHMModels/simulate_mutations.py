@@ -39,7 +39,8 @@ class MutationProcess(object):
                  ber_params=[0, 0, 1, 0],
                  aid_context_model=None,
                  gp_lengthscale={'space': 10, 'time': .2},
-                 overall_rate = 1):
+                 overall_rate = 1,
+                 replication_rate = 1):
         """Returns a MutationProcess object with a specified start_seq"""
         if not isinstance(start_seq, Seq):
             raise TypeError("The input sequence must be a Seq object")
@@ -59,6 +60,7 @@ class MutationProcess(object):
         self.NUCLEOTIDES = ["A", "G", "C", "T"]
         self.overall_rate = overall_rate
         self.aid_lesions_per_site = np.zeros((2, self.seq_len))
+        self.replication_rate = replication_rate
 
     def generate_mutations(self):
         self.sample_lesions()
@@ -76,9 +78,22 @@ class MutationProcess(object):
         """Sample repairs for every AID lesion."""
         # first get waiting times to recruit the BER/MMR machinery
         self.repair_types = []
+        ## add the repairs for the aid lesions
         for row in range(self.aid_lesions.shape[0]):
             lesion = self.aid_lesions[row,:]
             self.repair_types.append(self.sample_one_repair(lesion[0], lesion[1], lesion[2]))
+        ## add the replications
+        n_replications = np.random.poisson(self.replication_rate)
+        for _ in range(n_replications):
+            strand = int(np.random.binomial(1, .5))
+            replication_time = np.random.uniform(0.0, 1.0, 1)[0]
+            self.repair_types.append(Repair(strand = strand,
+                                            idx = np.nan,
+                                            aid_time = np.nan,
+                                            repair_type = "replication",
+                                            repair_time = replication_time,
+                                            exo_lo = 0,
+                                            exo_hi = self.seq_len))
 
     def sample_one_repair(self, strand, location, aid_time):
         # repair type is ber w.p. lambda_b / (lambda_b + lambda_m)
@@ -134,6 +149,13 @@ class MutationProcess(object):
                 if (old_base == "C") & (new_base != "C"):
                     c_mutations.append((strand, i))
                 exo_strips.append((strand, i))
+        elif repair.repair_type == "replication":
+            ## replication means the entire non-template strand is stripped out
+            nontemplate_strand = 1 - repair.strand
+            exo_strips = [(nontemplate_strand, i) for i in range(self.seq_len)]
+            ## replace the non-template strand with the complement of
+            ## the template strand
+            sequence[nontemplate_strand,:] = make_complement(sequence[strand, :])
         ## Mark repairs that will no longer happen
         # exo_strips and c_mutations are lists, elements are tuples of
         # (strand, idx) corresponding to locations of exo stripping or
@@ -184,11 +206,12 @@ class Repair(object):
     """
     def __init__(self, strand, idx, aid_time, repair_type, repair_time, exo_lo, exo_hi):
         self.strand = int(strand)
-        self.idx = int(idx)
+        if not np.isnan(idx):
+            self.idx = int(idx)
         self.aid_time = aid_time
         self.repair_time = repair_time
         self.repair_type = repair_type
-        if repair_type == "mmr":
+        if (repair_type == "mmr") or (repair_type == "replication"):
             self.exo_lo = int(exo_lo)
             self.exo_hi = int(exo_hi)
 
@@ -300,6 +323,22 @@ def draw_poisson_process_from_base_rate(base_rate_array):
             lesion_matrix[row, :] = [idx[0], idx[1], t]
             row = row + 1
     return lesion_matrix
+
+def make_complement(seq):
+    """Given a sequence, create its complement
+
+    Keyword arguments:
+    seq -- A list with A/T/C/G/U
+
+    Returns: A list, same length as seq, with A/T/C/G
+    """
+    substitutions = {"A" : "T",
+                     "T" : "A",
+                     "C" : "G",
+                     "G" : "C",
+                     "U" : "A"}
+    complement = [substitutions[s] for s in seq]
+    return complement
 
 def sigmoid(x):
   return 1 / (1 + np.exp(-x))
