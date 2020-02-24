@@ -6,22 +6,37 @@ The package can be installed using
 pip install .
 ```
 
-The primary function is `simulate_sequences_abc`, so for example,
+We can simulate mutated sequences by setting up a "mutation process" object and then calling the `generate_mutations` function.
+After mutations are generated, the MutationProcess object will contain the mutated sequence (in `repaired_sequence`) and an array giving the number of AID lesions at each position (`aid_lesions_per_site`).
 ```
-from SHMModels.simulate_mutations import simulate_sequences_abc
-simulate_sequences_abc("/Users/julia/GitHub/shmr/inst/extdata/gpt.fasta",
-    "data/aid_logistic_3mer.csv",
-    context_model_length = 3,
-    context_model_pos_mutating = 2,
-    n_seqs = 1,
-    n_mutation_rounds = 3,
-    ss_file = "for_nnet_ss.csv",
-    param_file = "for_nnet_params.csv",
-    sequence_file = "for_nnet_sequences.csv",
-    n_sims = 100000,
-    write_ss=False,
-    write_sequences=True)
+import pkgutil
+from Bio.Seq import Seq
+from Bio.Alphabet import IUPAC
+from SHMModels.mutation_processing import *
+from SHMModels.fitted_models import *
+from SHMModels.simulate_mutations import *
+
+naive_seq = Seq("CGCA", alphabet=IUPAC.unambiguous_dna)
+
+## ber always changes C to A
+ber_params=[1, 0, 0, 0]
+## here pol eta always changes C to T
+pol_eta_params={
+    'A': [1, 0, 0, 0],
+    'G': [0, 1, 0, 0],
+    'C': [0, 0, 0, 1],
+    'T': [0, 0, 0, 1]
+}
+cm = aid_context_model = ContextModel(3, 2, pkgutil.get_data("SHMModels", "data/aid_goodman.csv"))
+mp = MutationProcess(naive_seq,
+                     aid_context_model = cm,
+                     ber_params = ber_params,
+                     pol_eta_params = pol_eta_params,
+                     ber_lambda = .0100,
+                     mmr_lambda = .0100,
+                     overall_rate = 10,
+                     show_process = False)
+mp.generate_mutations()
+print(mp.aid_lesions_per_site)
+print(mp.repaired_sequence)
 ```
-will simulate sequences from a 3-mer model, second position mutating, one sequence per parameter setting, with three rounds of mutation.
-The sequences will be written to the file `for_nnet_sequences.csv` and the parameters used to generate those sequences will written to `for_nnet_params.csv`.
-Summary statistics are a bit deprecated at this point.
