@@ -1,5 +1,5 @@
 import csv
-import StringIO
+from io import StringIO
 import numpy as np
 import fnmatch
 
@@ -21,7 +21,7 @@ class ContextModel:
 
     def create_context_dict(self, csv_string):
         """makes a dictionary, keys are contexts and values are probability of mutation in one unit of time"""
-        reader = csv.reader(StringIO.StringIO(csv_string), delimiter=',')
+        reader = csv.reader(csv_string.decode('utf-8').splitlines(), delimiter=',')
         # skip the header
         next(reader, None)
         d = dict(reader)

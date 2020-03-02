@@ -84,7 +84,7 @@ def mutation_subset_from_samm(seqs_file, genes_file, base, strand, output_seqs=N
         mutated_seq = Seq(row["sequence"], alphabet=IUPAC.ambiguous_dna)
         naive_seq = Seq(genes_dict[row["germline_name"]], alphabet=IUPAC.ambiguous_dna)
         if len(mutated_seq) != len(naive_seq):
-            print "sequence lengths differ: {} and {}".format(len(mutated_seq), len(naive_seq))
+            print("sequence lengths differ: {} and {}".format(len(mutated_seq), len(naive_seq)))
         if strand == 'fw' or strand == 'both':
             (ms_naive, ms_mut) = mutation_subset(naive_seq, mutated_seq, base)
             new_row = row.copy()
